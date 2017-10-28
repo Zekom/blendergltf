@@ -24,6 +24,7 @@ DEFAULT_SETTINGS = {
     'buffers_combine_data': False,
     'nodes_export_hidden': False,
     'nodes_global_matrix': mathutils.Matrix.Identity(4),
+    'nodes_global_matrix_apply': True,
     'nodes_selected_only': False,
     'blocks_prune_unused': True,
     'meshes_apply_modifiers': True,
@@ -406,11 +407,19 @@ def togl(matrix):
     return [i for col in matrix.col for i in col]
 
 
-def decompose(matrix):
+def decompose(state, matrix):
     loc, rot, scale = matrix.decompose()
+
+    if state['settings']['nodes_global_matrix_apply']:
+        loc.rotate(state['settings']['nodes_global_matrix'])
+        xscale = scale.copy()
+        xscale.rotate(state['settings']['nodes_global_matrix'])
+        scale = [math.copysign(scalar, scale[i]) for i, scalar in enumerate(xscale.to_tuple())]
+    else:
+        scale = scale.to_tuple()
+
     loc = loc.to_tuple()
     rot = (rot.x, rot.y, rot.z, rot.w)
-    scale = scale.to_tuple()
 
     return loc, rot, scale
 
@@ -546,9 +555,11 @@ def export_material(state, material):
 
 
 def export_mesh(state, mesh):
+    mesh_name = mesh.name
+    mesh = state['mod_meshes'].get(mesh.name, mesh)
     # glTF data
     gltf_mesh = {
-        'name': mesh.name,
+        'name': mesh_name,
         'primitives': [],
     }
 
@@ -556,7 +567,7 @@ def export_mesh(state, mesh):
     if extras:
         gltf_mesh['extras'] = extras
 
-    is_skinned = mesh.name in state['skinned_meshes']
+    is_skinned = mesh_name in state['skinned_meshes']
 
     mesh.calc_normals_split()
     mesh.calc_tessface()
@@ -565,8 +576,8 @@ def export_mesh(state, mesh):
     num_col_layers = len(mesh.vertex_colors)
     vertex_size = (3 + 3 + num_uv_layers * 2 + num_col_layers * 3) * 4
 
-    buf = Buffer(mesh.name)
-    skin_buf = Buffer('{}_skin'.format(mesh.name))
+    buf = Buffer(mesh_name)
+    skin_buf = Buffer('{}_skin'.format(mesh_name))
 
     # Vertex data
 
@@ -916,7 +927,7 @@ def export_node(state, obj):
         node['children'].append(Reference('objects', child.name, node['children'], i))
         state['references'].append(node['children'][-1])
 
-    node['translation'], node['rotation'], node['scale'] = decompose(obj.matrix_local)
+    node['translation'], node['rotation'], node['scale'] = decompose(state, obj.matrix_local)
 
     extras = _get_custom_properties(obj)
     extras.update({
@@ -926,17 +937,19 @@ def export_node(state, obj):
         node['extras'] = extras
 
     if obj.type == 'MESH':
-        mesh = state['mod_meshes'].get(obj.name, obj.data)
+        mesh = state['mod_meshes_obj'].get(obj.name, obj.data)
+        mesh_name = mesh.name
+        mesh = state['mod_meshes'].get(mesh.name, mesh)
         if state['version'] < Version('2.0'):
             node['meshes'] = []
-            node['meshes'].append(Reference('meshes', mesh.name, node['meshes'], 0))
+            node['meshes'].append(Reference('meshes', mesh_name, node['meshes'], 0))
             state['references'].append(node['meshes'][0])
         else:
-            node['mesh'] = Reference('meshes', mesh.name, node, 'mesh')
+            node['mesh'] = Reference('meshes', mesh_name, node, 'mesh')
             state['references'].append(node['mesh'])
         armature = obj.find_armature()
         if armature:
-            state['skinned_meshes'][mesh.name] = obj
+            state['skinned_meshes'][mesh_name] = obj
             node['skin'] = Reference('skins', obj.name, node, 'skin')
             state['references'].append(node['skin'])
             if state['version'] < Version('2.0'):
@@ -998,7 +1011,11 @@ def export_joint(state, bone):
         ref.prop = i
         state['references'].append(ref)
 
-    gltf_joint['translation'], gltf_joint['rotation'], gltf_joint['scale'] = decompose(matrix)
+    (
+        gltf_joint['translation'],
+        gltf_joint['rotation'],
+        gltf_joint['scale']
+    ) = decompose(state, matrix)
 
     return gltf_joint
 
@@ -1263,7 +1280,7 @@ def export_animations(state, actions):
             sce.frame_set(frame)
 
             # Decompose here so we don't store a reference the matrix
-            channels[obj.name].append(decompose(obj.matrix_local))
+            channels[obj.name].append(decompose(state, obj.matrix_local))
 
             if obj.type == 'ARMATURE':
                 for pbone in obj.pose.bones:
@@ -1271,7 +1288,7 @@ def export_animations(state, actions):
                         mat = pbone.parent.matrix.inverted() * pbone.matrix
                     else:
                         mat = pbone.matrix
-                    channels[pbone.name].append(decompose(mat))
+                    channels[pbone.name].append(decompose(state, mat))
 
         gltf_channels = []
         gltf_parameters = {}
@@ -1500,6 +1517,7 @@ def export_gltf(scene_delta, settings=None):
         'version': Version(settings['asset_version']),
         'settings': settings,
         'animation_dt': 1.0 / bpy.context.scene.render.fps,
+        'mod_meshes_obj': {},
         'mod_meshes': {},
         'skinned_meshes': {},
         'dupli_nodes': [],
@@ -1526,6 +1544,8 @@ def export_gltf(scene_delta, settings=None):
     }
     state['input'].update({key: list(value) for key, value in scene_delta.items()})
 
+    temp_meshes = []
+
     # Apply modifiers
     mesh_list = []
     if settings['meshes_apply_modifiers']:
@@ -1547,20 +1567,31 @@ def export_gltf(scene_delta, settings=None):
 
             # Only convert meshes with modifiers, otherwise each non-modifier
             # user ends up with a copy of the mesh and we lose instancing
-            state['mod_meshes'].update(
+            state['mod_meshes_obj'].update(
                 {ob.name: ob.to_mesh(scene, True, 'PREVIEW') for ob in mod_users}
             )
 
             # Add unmodified meshes directly to the mesh list
             if len(mod_users) < mesh.users:
                 mesh_list.append(mesh)
-        mesh_list.extend(state['mod_meshes'].values())
+        mesh_list.extend(state['mod_meshes_obj'].values())
+        temp_meshes.extend(state['mod_meshes_obj'].values())
 
         # Restore armature pose positions
         for i, armature in enumerate(bpy.data.armatures):
             armature.pose_position = saved_pose_positions[i]
     else:
         mesh_list = scene_delta.get('meshes', [])
+
+    if settings['nodes_global_matrix_apply']:
+        transformed_meshes = [mesh.copy() for mesh in mesh_list]
+        for mesh in transformed_meshes:
+            mesh.transform(settings['nodes_global_matrix'], shape_keys=True)
+        temp_meshes.extend(transformed_meshes)
+        state['mod_meshes'].update(
+            {mesh.name: transformed_meshes[i] for i, mesh in enumerate(mesh_list)}
+        )
+
     state['input']['meshes'] = mesh_list
 
     exporter = collections.namedtuple('exporter', [
@@ -1642,7 +1673,11 @@ def export_gltf(scene_delta, settings=None):
         ext_exporter.export(state)
 
     # Insert root nodes if axis conversion is needed
-    if settings['nodes_global_matrix'] != mathutils.Matrix.Identity(4):
+    root_node_needed = (
+        not settings['nodes_global_matrix_apply']
+        and settings['nodes_global_matrix'] != mathutils.Matrix.Identity(4)
+    )
+    if root_node_needed:
         insert_root_nodes(state, togl(settings['nodes_global_matrix']))
 
     state['output'].update(export_buffers(state))
@@ -1674,7 +1709,7 @@ def export_gltf(scene_delta, settings=None):
         ref.source[ref.prop] = refmap[(ref.blender_type, ref.blender_name)]
 
     # Remove any temporary meshes from applying modifiers
-    for mesh in state['mod_meshes'].values():
+    for mesh in temp_meshes:
         bpy.data.meshes.remove(mesh)
 
     return gltf
