@@ -82,13 +82,21 @@ class ExtPropertyGroup(bpy.types.PropertyGroup):
 
 class ExportGLTF(bpy.types.Operator, ExportHelper, GLTFOrientationHelper):
     """Save a Khronos glTF File"""
-    bl_idname = "export_scene.gltf"
+    bl_idname = 'export_scene.gltf'
     bl_label = 'Export glTF'
 
-    filename_ext = ".gltf"
+    filename_ext = ''
     filter_glob = StringProperty(
-        default="*.gltf",
+        default='*.gltf;*.glb',
         options={'HIDDEN'},
+    )
+
+    # Override filepath to simplify linting
+    filepath = StringProperty(
+        name='File Path',
+        description='Filepath used for exporting the file',
+        maxlen=1024,
+        subtype='FILE_PATH'
     )
 
     check_extension = True
@@ -170,7 +178,7 @@ class ExportGLTF(bpy.types.Operator, ExportHelper, GLTFOrientationHelper):
     buffers_embed_data = BoolProperty(
         name='Embed Buffer Data',
         description='Embed buffer data into the glTF file',
-        default=False
+        default=True
     )
     buffers_combine_data = BoolProperty(
         name='Combine Buffer Data',
@@ -224,6 +232,25 @@ class ExportGLTF(bpy.types.Operator, ExportHelper, GLTFOrientationHelper):
     def invoke(self, context, event):
         self.update_extensions()
         return super().invoke(context, event)
+
+    def check(self, context):
+        redraw = False
+
+        if self.gltf_export_binary and self.filepath.endswith('.gltf'):
+            self.filepath = self.filepath[:-4] + 'glb'
+            redraw = True
+        elif not self.gltf_export_binary and self.filepath.endswith('.glb'):
+            self.filepath = self.filepath[:-3] + 'gltf'
+            redraw = True
+
+        if self.gltf_export_binary and self.buffers_embed_data and not self.buffers_combine_data:
+            self.buffers_combine_data = True
+            redraw = True
+
+        self.filename_ext = '.glb' if self.gltf_export_binary else '.gltf'
+        redraw = redraw or super().check(context)
+
+        return redraw
 
     def draw(self, context):
         self.update_extensions()

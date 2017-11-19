@@ -20,7 +20,7 @@ __all__ = ['export_gltf']
 DEFAULT_SETTINGS = {
     'gltf_output_dir': '',
     'gltf_name': 'gltf',
-    'gltf_export_binary': True,
+    'gltf_export_binary': False,
     'buffers_embed_data': True,
     'buffers_combine_data': False,
     'nodes_export_hidden': False,
